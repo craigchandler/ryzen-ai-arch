@@ -62,8 +62,6 @@ examples/
     benchmark.py
 scripts/
   activate-ryzen-ai.sh
-article/
-  getting-amd-ryzen-ai-npu-working-on-arch-linux.md
 ```
 
 ## 1. Verify that the kernel already supports the NPU
