@@ -1,14 +1,15 @@
 # AMD Ryzen AI / XDNA2 on Arch Linux and CachyOS
 
-This guide documents a working AMD Ryzen AI NPU stack on CachyOS/Arch Linux using the Linux kernel's **in-tree `amdxdna` driver**, XRT, the XDNA userspace plugin, and AMD Ryzen AI SDK.
+A reproducible setup for running AMD Ryzen AI / XDNA2 NPU workloads on Arch Linux and CachyOS while retaining the Linux kernel's **in-tree `amdxdna` driver**.
 
-It also includes a real-world validation using **Laya**, a 421M-parameter ModernBERT-based decision model.
+This repository documents a tested stack using XRT, the XDNA userspace plugin, Ryzen AI Software 1.8, ONNX Runtime with `VitisAIExecutionProvider`, and a real-world Laya inference workload.
 
-The important distinction from AMD's standard Arch packaging is that this setup **does not replace the working in-tree kernel driver with AMD's DKMS driver**. Only the userspace XDNA/XRT components are installed.
+> **Last tested:** 30 September 2026  
+> **Status:** Working on the hardware/software combination below. Treat the versions as a known-good set rather than assuming arbitrary future kernel/XRT/Ryzen AI combinations are interchangeable.
 
 ## Tested system
 
-Hardware:
+### Hardware
 
 ```text
 CPU/NPU : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
@@ -18,24 +19,52 @@ AIE     : aie2p, 6x8
 RAM     : 32 GB
 ```
 
-Software:
+### Software
 
 ```text
 Distribution       : CachyOS / Arch Linux
 Kernel             : 7.2.8-1-cachyos
-amdxdna             : in-tree kernel driver
+amdxdna            : in-tree kernel driver
 XRT                 : 2.26.0
 XDNA userspace      : 2.26.0
 NPU firmware        : 1.1.2.64
-Ryzen AI SDK        : 1.8
+Ryzen AI Software   : 1.8
 ONNX Runtime        : 1.27.0
 Python              : 3.12.14 via uv
 Execution provider  : VitisAIExecutionProvider
 ```
 
-AMD's current `xdna-driver` project explicitly lists Arch Linux as supported and documents XRT, the XDNA plugin and the required memlock configuration. Its normal packaging path installs AMD's external driver as well as the plugin; this guide deliberately retains the distro kernel driver instead.
+## Why this setup is different
 
----
+AMD's current [`xdna-driver`](https://github.com/amd/xdna-driver) repository supports Arch Linux and supplies Arch packaging for XRT, the XDNA driver and the userspace plugin. Its standard Arch path packages the external/DKMS `amdxdna` driver as a dependency of the plugin.
+
+On this CachyOS system the in-tree kernel driver already detected and operated the NPU correctly. Replacing it added an unnecessary kernel/compiler dependency, so this setup instead:
+
+1. keeps the in-tree `amdxdna` driver;
+2. builds XRT;
+3. builds the XDNA project with `-nokmod`;
+4. packages only the XDNA userspace plugin.
+
+AMD's official Ryzen AI Linux instructions currently target Ubuntu and Python 3.12. The Ryzen AI portions of this guide are an Arch adaptation of that environment: <https://ryzenai.docs.amd.com/en/latest/linux.html>.
+
+## Repository layout
+
+```text
+README.md
+pkgbuild/
+  PKGBUILD-xrt-plugin-amdxdna-intree
+docs/
+  laya.md
+  troubleshooting.md
+examples/
+  laya/
+    make_single_output.py
+    benchmark.py
+scripts/
+  activate-ryzen-ai.sh
+article/
+  getting-amd-ryzen-ai-npu-working-on-arch-linux.md
+```
 
 ## 1. Verify that the kernel already supports the NPU
 
@@ -43,196 +72,114 @@ Before building anything:
 
 ```bash
 uname -r
-
 lspci -nnk | grep -A4 -i -E '17f0|neural|signal processing'
-
 lsmod | grep amdxdna
-
-ls -l /dev/accel
-
+ls -l /dev/accel 2>/dev/null
 journalctl -b -k | grep -i amdxdna
 ```
 
-On the tested machine:
+The tested machine showed:
 
 ```text
 Kernel driver in use: amdxdna
 /dev/accel/accel0
-
-amdxdna 0000:c5:00.1:
 firmware amdnpu/17f0_10/npu_7.sbin
-
-Initialized amdxdna_accel_driver
 ```
 
 If `/dev/accel/accel0` exists and `amdxdna` is loaded, do not assume you need another kernel driver.
 
-### Kernel upgrade caveat
+### Check for a kernel/header mismatch
 
-During setup the running kernel was initially `7.2.7`, while the installed kernel and headers were `7.2.8`.
+During this setup, the running kernel was initially `7.2.7` while the installed kernel and headers were `7.2.8`. That made `modinfo amdxdna` misleading until the machine was rebooted into the matching kernel.
 
-That caused confusing results such as:
-
-```text
-modinfo amdxdna
-```
-
-failing even though the driver was loaded.
-
-After rebooting into the matching kernel:
-
-```text
-7.2.8-1-cachyos
-```
-
-`modinfo amdxdna` worked normally.
-
-Always check:
+Check before debugging driver builds:
 
 ```bash
 uname -r
 pacman -Q linux-cachyos linux-cachyos-headers
 ```
 
-before debugging driver build problems.
-
----
-
 ## 2. Configure memlock
 
-AMD requires sufficient locked memory for NPU buffer allocation. Their Arch instructions recommend unlimited memlock.
-
-Create:
+AMD's Arch instructions require sufficient locked memory for NPU access and recommend configuring it through `limits.d`.
 
 ```bash
 sudo mkdir -p /etc/security/limits.d
-
-sudo tee /etc/security/limits.d/99-amdxdna.conf >/dev/null <<'EOF'
+sudo tee /etc/security/limits.d/99-amdxdna.conf >/dev/null <<'LIMITS'
 * soft memlock unlimited
 * hard memlock unlimited
-EOF
+LIMITS
 ```
 
-Log out and back in, or reboot.
-
-Verify:
+Log out and back in, or reboot, then verify:
 
 ```bash
 ulimit -Sl
 ulimit -Hl
 ```
 
-Both should report:
+Both should report `unlimited`.
 
-```text
-unlimited
-```
+## 3. Clone XDNA and build XRT
 
----
-
-## 3. Build XRT
-
-Clone AMD's XDNA driver repository including its XRT submodule.
-
-From the XRT build directory:
+AMD's repository uses submodules, including XRT:
 
 ```bash
-cd ~/Source/Personal/xdna-driver/xrt/build
+git clone https://github.com/amd/xdna-driver.git
+cd xdna-driver
+git submodule update --init --recursive
+```
 
+Build XRT:
+
+```bash
+cd xrt/build
 ./build.sh -npu -opt
 ```
 
-### Arch PKGBUILD version mismatch
+### XRT Arch PKGBUILD version mismatch encountered
 
-In this build, XRT generated:
+The tested XRT build generated:
 
 ```text
 xrt_202620.2.26.0_--base.tar.gz
 xrt_202620.2.26.0_--npu.tar.gz
 ```
 
-but the supplied Arch PKGBUILDs still contained:
+while the supplied PKGBUILDs still contained `pkgver=202620.2.25.0`.
 
-```text
-pkgver=202620.2.25.0
-```
+The double `--` in the generated filenames was not the problem; the stale `pkgver` was.
 
-The double `--` in the generated filename is intentional. The issue was the stale package version.
-
-Update the PKGBUILDs:
+For that source revision, the fix was:
 
 ```bash
 cd arch
-
 sed -i 's/pkgver=202620\.2\.25\.0/pkgver=202620.2.26.0/' \
-  PKGBUILD-xrt-base \
-  PKGBUILD-xrt-npu
-```
-
-Build and install:
-
-```bash
-makepkg -C -p PKGBUILD-xrt-base
-
-sudo pacman -U \
-  ./xrt-base-202620.2.26.0-1-x86_64.pkg.tar.zst
+  PKGBUILD-xrt-base PKGBUILD-xrt-npu
 ```
 
 Then:
 
 ```bash
+makepkg -C -p PKGBUILD-xrt-base
+sudo pacman -U ./xrt-base-202620.2.26.0-1-x86_64.pkg.tar.zst
+
 makepkg -C -p PKGBUILD-xrt-npu
-
-sudo pacman -U \
-  ./xrt-npu-202620.2.26.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./xrt-npu-202620.2.26.0-1-x86_64.pkg.tar.zst
 ```
 
-Verify:
-
-```bash
-pacman -Q xrt-base xrt-npu
-ls /opt/xilinx/xrt/setup.sh
-```
-
----
+Do not copy these exact version substitutions blindly for a newer XRT checkout; inspect the generated archive version first.
 
 ## 4. Build only the XDNA userspace plugin
 
-This was the most important Arch/CachyOS-specific part of the setup.
+A normal full XDNA build tried to compile `amdxdna.ko`. On this system CachyOS had built the kernel with Clang 22.1.8, while the XDNA build invoked GCC 16.2.1. GCC rejected Clang-specific kernel flags.
 
-A normal full XDNA build attempted to build `amdxdna.ko`.
+Forcing Clang globally made the kernel module build but caused the userspace shim to fail because new Clang warnings were promoted to errors.
 
-CachyOS had built the kernel with:
-
-```text
-Clang 22.1.8
-```
-
-while the XDNA build invoked:
-
-```text
-GCC 16.2.1
-```
-
-GCC then failed on Clang-specific kernel flags including:
-
-```text
--mstack-alignment=8
--mretpoline-external-thunk
--fexperimental-late-parse-attributes
--fsplit-lto-unit
--mllvm
-```
-
-Forcing Clang globally fixed the kernel-module build, but then caused the userspace XDNA shim to fail because Clang warnings were promoted to errors with `-Werror`.
-
-Neither approach was necessary.
-
-AMD's build supports `-nokmod`, allowing us to keep the working kernel driver and build only userspace:
+Neither was necessary: keep the working in-tree driver and use AMD's `-nokmod` build mode.
 
 ```bash
 cd ~/Source/Personal/xdna-driver/build
-
 ./build.sh -clean
 
 unset CC
@@ -243,208 +190,90 @@ unset LLVM_IAS
 ./build.sh -release -nokmod
 ```
 
-The resulting archive was:
+The tested build produced:
 
 ```text
 Release/xrt_plugin.2.26.0_-x86_64-amdxdna.tar.gz
 ```
 
-It contained userspace components such as:
+containing userspace components such as `libvxdna.so` and `libxrt_driver_xdna.so`, without a replacement kernel module.
 
-```text
-/opt/xilinx/xrt/lib/libvxdna.so
-/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2
-/opt/xilinx/xrt/share/amdxdna/bins/...
-```
+## 5. Package the userspace plugin
 
-and no replacement kernel module.
+Use [`pkgbuild/PKGBUILD-xrt-plugin-amdxdna-intree`](pkgbuild/PKGBUILD-xrt-plugin-amdxdna-intree).
 
----
-
-## 5. Package the userspace plugin for Arch
-
-AMD's standard Arch plugin package expects its `amdxdna-driver` package and installation hooks.
-
-For an in-tree-driver setup, create a userspace-only package.
-
-Create:
-
-```text
-PKGBUILD-xrt-plugin-amdxdna-intree
-```
-
-with:
+From `xdna-driver/build/arch`:
 
 ```bash
-pkgname=xrt-plugin-amdxdna-intree
-pkgver=2.26.0
-pkgrel=1
-pkgdesc="AMD XDNA XRT userspace plugin using the in-tree Linux amdxdna driver"
-arch=('x86_64')
-url="https://github.com/amd/xdna-driver/"
-license=('Apache-2.0')
-
-depends=('xrt-base' 'xrt-npu')
-
-provides=("xrt-plugin-amdxdna=${pkgver}")
-conflicts=('xrt-plugin-amdxdna')
-
-options=('!debug' '!strip')
-
-package() {
-    local xdna_build_dir="${XDNA_BUILD_DIR:-$startdir/../Release}"
-    local tarball="${xdna_build_dir}/xrt_plugin.${pkgver}_-${CARCH}-amdxdna.tar.gz"
-
-    if [[ ! -f "$tarball" ]]; then
-        error "XDNA plugin tarball not found: $tarball"
-        return 1
-    fi
-
-    msg2 "Extracting $tarball"
-
-    tar -xzf "$tarball" -C "$pkgdir"
-}
+makepkg -C -p /path/to/ryzen-ai-arch/pkgbuild/PKGBUILD-xrt-plugin-amdxdna-intree
 ```
 
-Build:
+Or copy the PKGBUILD into that directory first and run:
 
 ```bash
 makepkg -C -p PKGBUILD-xrt-plugin-amdxdna-intree
+sudo pacman -U ./xrt-plugin-amdxdna-intree-2.26.0-1-x86_64.pkg.tar.zst
 ```
-
-Install:
-
-```bash
-sudo pacman -U \
-  ./xrt-plugin-amdxdna-intree-2.26.0-1-x86_64.pkg.tar.zst
-```
-
----
 
 ## 6. Validate XRT and the NPU
 
-Load the XRT environment:
-
 ```bash
 source /opt/xilinx/xrt/setup.sh
-```
-
-Then:
-
-```bash
 xrt-smi examine
-```
-
-The tested system reported:
-
-```text
-XRT
- Version              : 2.26.0
- amdxdna Version      : 7.2.8-1-cachyos
- NPU Firmware Version : 1.1.2.64
-
-Device(s) Present
-[0000:c5:00.1] NPU Gorgon Point 1 aie2p 6x8
-```
-
-Now validate:
-
-```bash
 xrt-smi validate
 ```
 
-Results on this machine:
+The tested machine reported:
 
 ```text
-Test 1 gemm:
-  TOPS: 51.0
-  PASSED
-
-Test 2 latency:
-  Average latency: 57.0 us
-  PASSED
-
-Test 3 throughput:
-  Average throughput: 94922.0 ops/s
-  PASSED
+XRT Version          : 2.26.0
+amdxdna Version      : 7.2.8-1-cachyos
+NPU Firmware Version : 1.1.2.64
+Device               : NPU Gorgon Point 1
+Architecture         : aie2p
+Topology             : 6x8
 ```
 
-At this point the kernel/XRT/XDNA stack is operational.
+Validation results:
 
-### Telemetry
-
-On this particular in-tree-driver setup:
-
-```bash
-xrt-smi examine --report all
+```text
+GEMM       : 51.0 TOPS   PASSED
+Latency    : 57.0 us     PASSED
+Throughput : 94922 ops/s PASSED
 ```
 
-reported N/A for some telemetry such as power, load and temperature.
+Some `xrt-smi examine --report all` telemetry fields were `N/A` on this particular in-tree-driver/userspace combination, while execution and validation still worked.
 
-Execution nevertheless worked correctly.
+## 7. Install Python 3.12 without replacing Arch Python
 
-AMD notes that newer XRT userspace can request ioctls not present in an older in-tree `amdxdna`, causing telemetry or array-query functionality to be unavailable while core execution still works.
-
-Do not assume this particular in-tree/XRT combination will remain compatible indefinitely. Pin and record known-working versions.
-
----
-
-# Ryzen AI SDK
-
-## 7. Install Python 3.12 without changing Arch's system Python
-
-Ryzen AI 1.8 expects Python 3.12.
-
-The tested Arch installation was already on Python 3.14, so Python 3.12 was installed using `uv` rather than replacing the system interpreter:
+Ryzen AI Software 1.8's Linux instructions use Python 3.12. Arch on the tested machine was already on Python 3.14, so Python 3.12 was installed with `uv`:
 
 ```bash
 uv python install 3.12
-
 uv python find 3.12
 ```
 
-Result:
-
-```text
-~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12
-```
-
-Expose it temporarily:
+Expose it to AMD's installer:
 
 ```bash
 PY312="$(uv python find 3.12)"
 export PATH="$(dirname "$PY312"):$PATH"
-```
-
-Verify:
-
-```bash
 python3.12 --version
 ```
 
-Tested version:
+Tested version: `Python 3.12.14`.
 
-```text
-Python 3.12.14
-```
+## 8. Install Ryzen AI Software 1.8
 
----
-
-## 8. Install Ryzen AI SDK 1.8
-
-The AMD installer contains some Ubuntu-specific `dpkg` checks.
-
-Install the Arch equivalents:
+Install Arch equivalents of the Ubuntu prerequisites checked by the installer:
 
 ```bash
 sudo pacman -S --needed linux-api-headers zip
 ```
 
-Then:
+Then from the extracted Ryzen AI 1.8 directory:
 
 ```bash
-cd ~/Source/ryzen_ai
-
 PY312="$(uv python find 3.12)"
 export PATH="$(dirname "$PY312"):$PATH"
 
@@ -453,463 +282,124 @@ export PATH="$(dirname "$PY312"):$PATH"
   -p ~/Source/ryzen_ai/venv
 ```
 
-Activate:
+Activate it:
 
 ```bash
 source ~/Source/ryzen_ai/venv/bin/activate
 source /opt/xilinx/xrt/setup.sh
 ```
 
----
+## 9. Arch compatibility fixes required on the tested system
 
-## 9. Fix executable-stack metadata
+### Executable-stack metadata
 
-Initially:
-
-```python
-import onnxruntime
-```
-
-failed with:
+Importing AMD's ONNX Runtime initially failed with:
 
 ```text
 cannot enable executable stack as shared object requires: Invalid argument
 ```
 
-The affected library was:
-
-```text
-onnxruntime/capi/onnxruntime_pybind11_state.so
-```
-
-Install `patchelf`:
+The affected object was `onnxruntime_pybind11_state.so`.
 
 ```bash
 sudo pacman -S --needed patchelf
-```
 
-Check:
-
-```bash
 SO=~/Source/ryzen_ai/venv/lib/python3.12/site-packages/onnxruntime/capi/onnxruntime_pybind11_state.so
-
 patchelf --print-execstack "$SO"
-```
-
-It reported:
-
-```text
-execstack: X
-```
-
-Clear it:
-
-```bash
 patchelf --clear-execstack "$SO"
-```
-
-Verify:
-
-```bash
 patchelf --print-execstack "$SO"
 ```
 
-Expected:
-
-```text
-execstack: -
-```
-
-ONNX Runtime then loaded correctly:
-
-```python
-import onnxruntime as ort
-
-print(ort.__version__)
-print(ort.get_available_providers())
-```
-
-Result:
-
-```text
-1.27.0
-['VitisAIExecutionProvider', 'CPUExecutionProvider']
-```
-
----
-
-## 10. Arch compatibility libraries
-
-Two more Ubuntu assumptions appeared while running real models.
+The final state should be `execstack: -`.
 
 ### `libncurses.so.6`
 
-AMD's Vitis AI binary expected:
+The Vitis AI EP expected `libncurses.so.6`, while Arch supplied the ABI-compatible wide-character runtime as `/usr/lib/libncursesw.so.6`.
 
-```text
-libncurses.so.6
-```
-
-Arch provided:
-
-```text
-/usr/lib/libncursesw.so.6
-```
-
-Rather than modifying `/usr/lib`, create an isolated compatibility directory:
+Keep the compatibility link private rather than modifying `/usr/lib`:
 
 ```bash
 mkdir -p ~/Source/ryzen_ai/compat-lib
-
 ln -sf /usr/lib/libncursesw.so.6 \
   ~/Source/ryzen_ai/compat-lib/libncurses.so.6
 ```
 
 ### `libpython3.12.so.1.0`
 
-The FlexML runtime also expected the shared Python library on the system library path.
-
-The `uv` Python contained:
-
-```text
-~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/lib/libpython3.12.so.1.0
-```
-
-Set:
+FlexML also expected the Python 3.12 shared library on a normal runtime library path. With `uv`, it is under the managed Python installation.
 
 ```bash
 PYBASE="$(python -c 'import sys; print(sys.base_prefix)')"
-
 export LD_LIBRARY_PATH="$HOME/Source/ryzen_ai/compat-lib:$PYBASE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
 Verify:
 
 ```bash
-ldd \
-  ~/Source/ryzen_ai/venv/lib/python3.12/site-packages/flexmlrt/lib/libflexmlrt.so \
+ldd ~/Source/ryzen_ai/venv/lib/python3.12/site-packages/flexmlrt/lib/libflexmlrt.so \
   | grep -E 'libpython|not found'
 ```
 
-No dependency should report `not found`.
+The provided [`scripts/activate-ryzen-ai.sh`](scripts/activate-ryzen-ai.sh) wraps the activation steps used by this setup.
 
-These environment settings are good candidates for a small activation script rather than placing them globally in the shell environment.
+## 10. Verify the Ryzen AI runtime
 
----
+```bash
+python - <<'PY'
+import onnxruntime as ort
+print(ort.__version__)
+print(ort.get_available_providers())
+PY
+```
 
-## 11. Run AMD quicktest
-
-Run AMD's bundled Ryzen AI quicktest.
-
-A successful run verifies:
+The tested environment returned:
 
 ```text
-Python
-  ↓
-ONNX Runtime
-  ↓
-VitisAIExecutionProvider
-  ↓
-XRT
-  ↓
-XDNA userspace
-  ↓
-amdxdna
-  ↓
-NPU
+1.27.0
+['VitisAIExecutionProvider', 'CPUExecutionProvider']
 ```
 
-The quicktest passed on the tested system.
+AMD's bundled quicktest then passed:
 
-At this point the Ryzen AI platform installation was considered complete.
+```bash
+cd ~/Source/ryzen_ai/venv/quicktest
+python quicktest.py
+```
 
----
+A successful quicktest proves an actual model can compile and execute through the NPU path, not merely that the PCI device is visible.
 
-# Real-world test: Laya
+## 11. Real-world validation: Laya
 
-## 12. Model
+The real-world test used the public [`receptron/laya-onnx`](https://huggingface.co/receptron/laya-onnx) export of [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya), a 421M-parameter ModernBERT-based decision model.
 
-Laya is a 421M-parameter ModernBERT-based decision model.
-
-The published ONNX export has these inputs:
+Key results on the final single-output graph:
 
 ```text
-input_ids       [B,L] int64
-attention_mask  [B,L] int64
-marker_pos      [B,K] int64
-marker_mask     [B,K] bool
-qtype           [B]   int64
+Operators in model          : 1611
+Operators supported by VAIML: 1598 (99.193%)
+Model GOPs                  : 420.556
+GOPs supported by VAIML    : 420.546 (99.998%)
+VAIML subgraphs             : 4
+EP report                   : 1461 VAIML / 119 CPU
 ```
 
-and outputs:
+The published two-output graph (`logits`, `act_probs`) compiled but returned `NaN` on this tested stack. AMD has an open issue describing incorrect or NaN values for some multi-output ONNX graphs under `VitisAIExecutionProvider`: <https://github.com/amd/RyzenAI-SW/issues/369>.
 
-```text
-logits      [B,K]
-act_probs   [B,2]
-```
+A single-output graph containing `logits` produced correct finite results matching the CPU reference for the test input.
 
-The public ONNX bundle contains the FP32 graph and external weights.
+See [`docs/laya.md`](docs/laya.md) for the complete model-specific workflow, including fixed dimensions, the single-output conversion and validation evidence.
 
----
+## Benchmarking
 
-## 13. Dynamic shapes do not compile cleanly
+A single observation is not a publishable benchmark. Use [`examples/laya/benchmark.py`](examples/laya/benchmark.py) to collect warmed repeated CPU/NPU timings and validate every NPU result against the CPU reference.
 
-The original graph used dynamic dimensions:
+The script defaults to 5 warm-up iterations and 20 measured iterations.
 
-```text
-batch
-seq
-options
-```
+## Troubleshooting
 
-Vitis loaded the graph but crashed while compiling the dynamic version.
+All failure modes encountered during the setup are collected in [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
-For the first NPU build, the dimensions were fixed through ONNX Runtime:
-
-```python
-so.add_free_dimension_override_by_name("batch", 1)
-so.add_free_dimension_override_by_name("seq", 512)
-so.add_free_dimension_override_by_name("options", 20)
-```
-
-Vitis then saw:
-
-```text
-input_ids       [1x512]
-attention_mask  [1x512]
-marker_pos      [1x20]
-marker_mask     [1x20]
-qtype           [1]
-
-logits           [1x20]
-act_probs        [1x2]
-```
-
-and successfully compiled the model.
-
----
-
-## 14. Vitis partitioning result
-
-For the final single-output Laya graph:
-
-```text
-Number of operators in model:
-1611
-
-Operators supported by VAIML:
-1598
-99.193%
-
-GOPs in model:
-420.556
-
-GOPs supported by VAIML:
-420.546
-99.998%
-
-VAIML subgraphs:
-4
-```
-
-The execution-provider report contained:
-
-```text
-1461 VAIML
-119 CPU
-```
-
-The most computationally expensive subgraph alone contained:
-
-```text
-1460 operators
-391.888 GOPs
-93.183% of total model compute
-```
-
-So although some graph operations remain on CPU, essentially all significant model compute is NPU-capable.
-
----
-
-# Laya multi-output issue
-
-## 15. Original graph produced NaNs
-
-The original Laya ONNX model has two outputs:
-
-```text
-logits
-act_probs
-```
-
-It compiled and executed through `VitisAIExecutionProvider`, but both outputs contained `NaN`.
-
-The CPU version of the same graph was correct.
-
-For a test question:
-
-```text
-A production web service has stopped accepting requests.
-Monitoring shows that the database disk is completely full.
-```
-
-with choices:
-
-```text
-Restart the web server
-Free space on the database disk
-Wait and see if the service recovers
-```
-
-CPU produced:
-
-```text
-0.0059  Restart the web server
-0.9877  Free space on the database disk
-0.0064  Wait and see if the service recovers
-```
-
-while the NPU graph returned:
-
-```text
-NaN
-NaN
-NaN
-```
-
-This behaviour is consistent with an open AMD Ryzen AI issue documenting incorrect or NaN results for some multi-output ONNX graphs under Vitis AI EP. The issue specifically reports cases where changing only the number of declared outputs turns correct single-output execution into incorrect multi-output execution.
-
-The issue does **not** claim every multi-output model is broken; AMD models exist which work correctly with multiple outputs.
-
----
-
-## 16. Single-output workaround
-
-A second ONNX graph was created containing only:
-
-```text
-logits
-```
-
-The external model weights were unchanged.
-
-That graph compiled successfully using a separate cache key:
-
-```text
-laya-logits-b1-s512-k20
-```
-
-The same test then produced:
-
-```text
-CPU:
-0.0059  Restart the web server
-0.9877  Free space on the database disk
-0.0064  Wait and see if the service recovers
-
-NPU:
-0.0059  Restart the web server
-0.9877  Free space on the database disk
-0.0064  Wait and see if the service recovers
-```
-
-Raw logits:
-
-```text
-CPU:
-[-1.7870014, 3.3337939, -1.7052455]
-
-NPU:
-[-1.7870014, 3.3337939, -1.7052455]
-```
-
-Maximum observed difference:
-
-```text
-0.0
-```
-
-and:
-
-```text
-Finite NPU output: True
-```
-
-The Vitis execution report independently confirmed substantial VAIML assignment, so this was not simply CPU fallback.
-
----
-
-# Current status
-
-The following has been verified on this machine:
-
-- Linux in-tree `amdxdna` detects the XDNA2 NPU.
-- XRT 2.26 communicates with it.
-- AMD's userspace XDNA plugin works without replacing the kernel driver.
-- `xrt-smi validate` passes.
-- Ryzen AI SDK 1.8 runs on CachyOS/Arch with compatibility fixes.
-- AMD quicktest passes.
-- `VitisAIExecutionProvider` is available.
-- Laya compiles for the NPU with fixed dimensions.
-- 99.998% of Laya's measured GOPs are VAIML-supported.
-- Actual Laya NPU inference produces correct finite results using the single-output graph.
-- The original two-output graph produces invalid values on this tested stack.
-
-## Benchmark status
-
-A single observed inference showed lower NPU latency than CPU, but that figure is intentionally not published as a benchmark.
-
-A proper benchmark should use:
-
-- several warm-up iterations;
-- at least 20 measured CPU iterations;
-- at least 20 measured NPU iterations;
-- median and mean latency;
-- output validation on every iteration.
-
-Until that test is performed, this guide makes no general performance claim.
-
----
-
-# Troubleshooting summary
-
-| Symptom | Cause in this setup | Resolution |
-|---|---|---|
-| `modinfo amdxdna` fails | Running kernel older than installed modules | Reboot into matching kernel |
-| XRT Arch package looks for wrong tarball version | Stale `pkgver` | Match PKGBUILD version to generated XRT |
-| Kernel module build fails with GCC flags | CachyOS kernel built with Clang | Do not rebuild kernel driver; use `-nokmod` |
-| Userspace build fails under forced Clang | Warnings promoted to errors | Build userspace normally with GCC |
-| `xrt-smi` finds zero devices | XDNA userspace shim absent | Install userspace plugin |
-| memlock allocation errors | Locked-memory limit | Set memlock unlimited |
-| ONNX Runtime refuses executable stack | ELF executable-stack metadata | `patchelf --clear-execstack` |
-| Vitis EP cannot find `libncurses.so.6` | Ubuntu/Arch ncurses naming difference | Private compatibility symlink |
-| FlexML cannot find `libpython3.12.so.1.0` | Python 3.12 supplied by `uv` | Add `$PYBASE/lib` to `LD_LIBRARY_PATH` |
-| Dynamic Laya compile crashes | Dynamic dimensions | Override `batch`, `seq`, `options` |
-| Laya returns `NaN` on NPU | Two-output graph on tested Vitis AI stack | Use single-output graph |
-| Some XRT telemetry is N/A | Userspace/in-tree ioctl difference | Core execution still works; pin versions |
-
----
-
-# Why retain the in-tree driver?
-
-This approach made sense because the kernel already contained a functioning `amdxdna` driver for the hardware.
-
-Replacing it would have introduced:
-
-- DKMS lifecycle management;
-- another kernel/compiler compatibility dependency;
-- replacement firmware;
-- increased risk during kernel upgrades.
-
-The compromise is that newer userspace packages may eventually expect driver APIs absent from a distro's in-tree driver.
-
-For that reason this guide should be treated as a **known-working versioned configuration**, not a claim that arbitrary future XRT and kernel versions can be mixed safely.
-
----
-
-# Result
-
-A Ryzen AI XDNA2 NPU can be used for real ONNX inference on CachyOS/Arch Linux without replacing the distro's working in-tree `amdxdna` driver.
+## Result
 
 The final tested path is:
 
@@ -920,7 +410,7 @@ ONNX Runtime 1.27.0
       ↓
 VitisAIExecutionProvider
       ↓
-Ryzen AI SDK 1.8
+Ryzen AI Software 1.8
       ↓
 XRT 2.26.0
       ↓
@@ -931,4 +421,14 @@ Linux in-tree amdxdna
 AMD XDNA2 NPU
 ```
 
-The process is not yet a simple `pacman -S` installation, but it is reproducible — and, importantly, it runs an actual transformer-derived model rather than merely detecting the accelerator.
+The important outcome is not merely that Linux detects the NPU: a real transformer-derived ONNX model was compiled, substantially offloaded to VAIML, and executed successfully while retaining the CachyOS in-tree `amdxdna` driver.
+
+## References
+
+- AMD XDNA Linux driver: <https://github.com/amd/xdna-driver>
+- AMD Ryzen AI Software 1.8 documentation: <https://ryzenai.docs.amd.com/en/latest/>
+- AMD Ryzen AI Linux installation: <https://ryzenai.docs.amd.com/en/latest/linux.html>
+- AMD RyzenAI-SW examples: <https://github.com/amd/RyzenAI-SW>
+- AMD multi-output Vitis AI issue #369: <https://github.com/amd/RyzenAI-SW/issues/369>
+- Laya: <https://huggingface.co/convaiinnovations/laya>
+- Laya ONNX export: <https://huggingface.co/receptron/laya-onnx>

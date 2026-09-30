@@ -1,0 +1,13 @@
+# Local model payloads and compile caches
+model/
+cache/
+*.onnx.data
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local reports/logs
+*.log
+*ep-report*.json

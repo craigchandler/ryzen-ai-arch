@@ -1,0 +1,26 @@
+pkgname=xrt-plugin-amdxdna-intree
+pkgver=2.26.0
+pkgrel=1
+pkgdesc="AMD XDNA XRT userspace plugin using the in-tree Linux amdxdna driver"
+arch=('x86_64')
+url="https://github.com/amd/xdna-driver/"
+license=('Apache-2.0')
+
+depends=('xrt-base' 'xrt-npu')
+provides=("xrt-plugin-amdxdna=${pkgver}")
+conflicts=('xrt-plugin-amdxdna')
+
+options=('!debug' '!strip')
+
+package() {
+    local xdna_build_dir="${XDNA_BUILD_DIR:-$startdir/../Release}"
+    local tarball="${xdna_build_dir}/xrt_plugin.${pkgver}_-${CARCH}-amdxdna.tar.gz"
+
+    if [[ ! -f "$tarball" ]]; then
+        error "XDNA plugin tarball not found: $tarball"
+        return 1
+    fi
+
+    msg2 "Extracting $tarball"
+    tar -xzf "$tarball" -C "$pkgdir"
+}
