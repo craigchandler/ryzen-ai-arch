@@ -4,7 +4,7 @@ A reproducible setup for running AMD Ryzen AI / XDNA2 NPU workloads on Arch Linu
 
 This repository documents a tested stack using XRT, the XDNA userspace plugin, Ryzen AI Software 1.8, ONNX Runtime with `VitisAIExecutionProvider`, and a real-world Laya inference workload.
 
-> **Last tested:** 30 September 2026  
+> **Last tested:** 1 October 2026  
 > **Status:** Working on the hardware/software combination below. Treat the versions as a known-good set rather than assuming arbitrary future kernel/XRT/Ryzen AI combinations are interchangeable.
 
 ## Tested system
@@ -45,7 +45,9 @@ On this CachyOS system the in-tree kernel driver already detected and operated t
 3. builds the XDNA project with `-nokmod`;
 4. packages only the XDNA userspace plugin.
 
-AMD's official Ryzen AI Linux instructions currently target Ubuntu and Python 3.12. The Ryzen AI portions of this guide are an Arch adaptation of that environment: <https://ryzenai.docs.amd.com/en/latest/linux.html>.
+AMD's official Ryzen AI Linux instructions currently target Ubuntu and Python 3.12. The Ryzen AI portions of this guide are an Arch adaptation of that environment:
+
+<https://ryzenai.docs.amd.com/en/latest/linux.html>
 
 ## Repository layout
 
@@ -62,8 +64,6 @@ examples/
     benchmark.py
 scripts/
   activate-ryzen-ai.sh
-article/
-  getting-amd-ryzen-ai-npu-working-on-arch-linux.md
 ```
 
 ## 1. Verify that the kernel already supports the NPU
@@ -261,7 +261,11 @@ export PATH="$(dirname "$PY312"):$PATH"
 python3.12 --version
 ```
 
-Tested version: `Python 3.12.14`.
+Tested version:
+
+```text
+Python 3.12.14
+```
 
 ## 8. Install Ryzen AI Software 1.8
 
@@ -375,25 +379,172 @@ The real-world test used the public [`receptron/laya-onnx`](https://huggingface.
 Key results on the final single-output graph:
 
 ```text
-Operators in model          : 1611
-Operators supported by VAIML: 1598 (99.193%)
-Model GOPs                  : 420.556
-GOPs supported by VAIML    : 420.546 (99.998%)
-VAIML subgraphs             : 4
-EP report                   : 1461 VAIML / 119 CPU
+Operators in model           : 1611
+Operators supported by VAIML : 1598 (99.193%)
+Model GOPs                   : 420.556
+GOPs supported by VAIML      : 420.546 (99.998%)
+VAIML subgraphs              : 4
+EP report                    : 1461 VAIML / 119 CPU
 ```
 
-The published two-output graph (`logits`, `act_probs`) compiled but returned `NaN` on this tested stack. AMD has an open issue describing incorrect or NaN values for some multi-output ONNX graphs under `VitisAIExecutionProvider`: <https://github.com/amd/RyzenAI-SW/issues/369>.
+The published two-output graph (`logits`, `act_probs`) compiled but returned `NaN` on this tested stack.
 
-A single-output graph containing `logits` produced correct finite results matching the CPU reference for the test input.
+AMD issue #369 documents incorrect or NaN output for some multi-output ONNX graphs under `VitisAIExecutionProvider`:
 
-See [`docs/laya.md`](docs/laya.md) for the complete model-specific workflow, including fixed dimensions, the single-output conversion and validation evidence.
+<https://github.com/amd/RyzenAI-SW/issues/369>
+
+The issue does **not** show that every multi-output graph is affected.
+
+A single-output graph containing only `logits` produced correct finite results matching the CPU reference for the test input.
+
+See [`docs/laya.md`](docs/laya.md) for the complete model-specific workflow.
+
+## 12. Laya benchmark results
+
+The single-output Laya model was benchmarked with:
+
+- 5 warm-up iterations per provider;
+- 20 measured iterations per provider;
+- fixed sequence length `512`;
+- 20 option slots;
+- CPU and NPU sessions kept alive for the complete test;
+- compilation/session creation excluded from measured latency;
+- every NPU result checked for finite values and agreement with the CPU reference.
+
+### Batch 1
+
+```text
+CPU mean             : 1192.48 ms
+CPU median           : 1196.04 ms
+CPU P95              : 1245.68 ms
+
+NPU mean             : 1165.34 ms
+NPU median           : 1156.77 ms
+NPU P95              : 1210.85 ms
+
+Median NPU speedup   : 1.034x
+Median reduction     : 3.3%
+Maximum output diff  : 0.00000000
+```
+
+### Batch 8
+
+```text
+CPU median batch     : 8951.86 ms
+CPU median/decision  : 1118.98 ms
+CPU throughput       : 0.89 decisions/s
+
+NPU median batch     : 8993.51 ms
+NPU median/decision  : 1124.19 ms
+NPU throughput       : 0.89 decisions/s
+
+NPU speedup          : 0.995x
+Throughput gain      : -0.5%
+Maximum output diff  : 0.00000000
+```
+
+### Batch 16
+
+```text
+CPU median batch     : 21700.34 ms
+CPU median/decision  : 1356.27 ms
+CPU throughput       : 0.74 decisions/s
+
+NPU median batch     : 21752.76 ms
+NPU median/decision  : 1359.55 ms
+NPU throughput       : 0.74 decisions/s
+
+NPU speedup          : 0.998x
+Throughput gain      : -0.2%
+Maximum output diff  : 0.00000000
+```
+
+### Interpretation
+
+For this model on this Ryzen AI 9 HX 470 system, the XDNA2 NPU does **not** provide a meaningful end-to-end latency or throughput advantage over CPU execution.
+
+Batch 1 showed a small 3.3% median latency advantage for the NPU. At batch sizes 8 and 16, CPU and NPU throughput were effectively identical.
+
+Batch 16 was slower per decision than batch 8 on both providers, so increasing the batch beyond 8 did not improve this workload.
+
+This does not imply that the NPU is generally no faster than the CPU. Accelerator performance is workload-dependent. The result here is specifically that **Laya is a useful functional NPU validation workload, but not a performance showcase for XDNA2 on this CPU**.
+
+A remaining useful comparison would be host CPU utilisation under sustained CPU-provider versus NPU-provider inference. Similar latency could still be operationally useful if NPU execution leaves substantially more CPU capacity available to other workloads.
+
+## 13. Compiled cache persistence limitation
+
+The raw Vitis cache used during the Laya tests could not be reliably reloaded by a second Python process.
+
+After a successful compile and inference, a later process failed with:
+
+```text
+Failed to open file:
+.../vaiml_par_0/partition-info.json
+
+Failed to parse JSON ...
+attempting to parse an empty input
+
+HW context creation unsuccessful
+```
+
+The failure was reproduced without rebooting.
+
+At the time of the failure the environment remained:
+
+```text
+Kernel             : 7.2.8-1-cachyos
+amdxdna            : 7.2.8-1-cachyos
+XRT                 : 2.26.0
+XDNA userspace      : 2.26.0
+NPU firmware        : 1.1.2.64
+```
+
+so a version change did not explain the failed reload.
+
+AMD issue #324 describes a similar class of disk-cache/load problem when using `enable_cache_file_io_in_mem=0`:
+
+<https://github.com/amd/RyzenAI-SW/issues/324>
+
+For reproducible benchmarking on this setup, a fresh cache is compiled and the benchmark is performed in the **same Python process** that creates the NPU session.
+
+An ONNX Runtime EP Context Cache experiment was also attempted. After compilation work, ONNX Runtime reported:
+
+```text
+Unable to compile any nodes.
+ONNX Runtime will not generate a compiled model.
+Either the session EPs do not support compilation
+or the model is already compiled.
+```
+
+No reusable EP-context model was generated in this tested configuration.
+
+This is documented as an observed limitation of the tested stack, not as a general statement that Vitis AI caching or EP Context Cache cannot work on other models or supported platforms.
 
 ## Benchmarking
 
-A single observation is not a publishable benchmark. Use [`examples/laya/benchmark.py`](examples/laya/benchmark.py) to collect warmed repeated CPU/NPU timings and validate every NPU result against the CPU reference.
+Use [`examples/laya/benchmark.py`](examples/laya/benchmark.py).
 
-The script defaults to 5 warm-up iterations and 20 measured iterations.
+For the tested environment, use a fresh cache so compilation and benchmarking happen within the same process:
+
+```bash
+python examples/laya/benchmark.py \
+  --batch 1 \
+  --fresh-cache
+```
+
+Batch throughput tests:
+
+```bash
+python examples/laya/benchmark.py \
+  --batch 8 \
+  --fresh-cache
+
+python examples/laya/benchmark.py \
+  --batch 16 \
+  --fresh-cache
+```
+
+The script defaults to 5 warm-ups and 20 measured iterations and validates every NPU output against the CPU reference.
 
 ## Troubleshooting
 
@@ -421,14 +572,17 @@ Linux in-tree amdxdna
 AMD XDNA2 NPU
 ```
 
-The important outcome is not merely that Linux detects the NPU: a real transformer-derived ONNX model was compiled, substantially offloaded to VAIML, and executed successfully while retaining the CachyOS in-tree `amdxdna` driver.
+The important outcome is not merely that Linux detects the NPU: a real transformer-derived ONNX model was compiled, substantially offloaded to VAIML, executed successfully, numerically validated against CPU execution, and benchmarked while retaining the CachyOS in-tree `amdxdna` driver.
+
+For Laya specifically, the benchmark shows CPU/NPU performance parity rather than a substantial NPU speedup.
 
 ## References
 
 - AMD XDNA Linux driver: <https://github.com/amd/xdna-driver>
-- AMD Ryzen AI Software 1.8 documentation: <https://ryzenai.docs.amd.com/en/latest/>
+- AMD Ryzen AI Software documentation: <https://ryzenai.docs.amd.com/en/latest/>
 - AMD Ryzen AI Linux installation: <https://ryzenai.docs.amd.com/en/latest/linux.html>
 - AMD RyzenAI-SW examples: <https://github.com/amd/RyzenAI-SW>
 - AMD multi-output Vitis AI issue #369: <https://github.com/amd/RyzenAI-SW/issues/369>
+- AMD cache issue #324: <https://github.com/amd/RyzenAI-SW/issues/324>
 - Laya: <https://huggingface.co/convaiinnovations/laya>
 - Laya ONNX export: <https://huggingface.co/receptron/laya-onnx>
